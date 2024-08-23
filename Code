@@ -1,0 +1,98 @@
+from dateutil import parser, tz
+from datetime import datetime
+import requests
+import csv
+import pytz
+
+# Configuration
+wfo = "CLE"
+start_date = "2024-01-01T00:00:00Z"
+end_date = "2024-08-21T00:00:00Z"
+priority_county = "Cuyahoga OH"
+
+def utc_to_cdt(utc_dt):
+    if isinstance(utc_dt, str):
+        utc_dt = parser.parse(utc_dt)
+    utc_dt = utc_dt.replace(tzinfo=tz.tzutc())
+    cdt_dt = utc_dt.astimezone(tz.gettz('America/Chicago'))  # Convert to CDT
+    return cdt_dt.strftime('%Y-%m-%d %I:%M:%S %p')  # Return as string in readable format, including AM/PM
+
+def get_detailed_warning_data(wfo, year, phenomena, etn, significance):
+    api_url = f"https://mesonet.agron.iastate.edu/json/vtec_event.py?wfo={wfo}&year={year}&phenomena={phenomena}&etn={etn}&significance={significance}"
+    print(f"Fetching detailed warning data: {api_url}")
+    response = requests.get(api_url)
+    if response.status_code == 200:
+        data = response.json()
+        if "ugcs" in data and len(data["ugcs"]) > 0 and "utc_init_expire" in data["ugcs"][0]:
+            print(f"Found initial expire time for ETN {etn}")
+            return data["ugcs"][0]["utc_init_expire"]
+        else:
+            print(f"Initial expire time not found for ETN {etn}")
+            return None
+    else:
+        print(f"Failed to fetch detailed data for ETN {etn}, status code: {response.status_code}")
+        if response.status_code == 422:
+            print(f"Error details: {response.json()}")
+        return None
+
+def get_tornado_warnings(wfo, start_date, end_date):
+    api_url = f"https://mesonet.agron.iastate.edu/api/1/cow.json?wfo={wfo}&begints={start_date}&endts={end_date}&phenomena=TO&lsrtype=T&lsrbuffer=15&warningbuffer=1"
+    print(f"Fetching tornado warnings: {api_url}")
+    response = requests.get(api_url)
+    if response.status_code == 200:
+        print("Tornado warnings fetched successfully")
+        return response.json()
+    else:
+        print(f"Failed to fetch data from the API, status code: {response.status_code}")
+        return None
+
+def calculate_duration(start_time, init_expire_time):
+    start_time_cdt = utc_to_cdt(start_time)
+    expire_time_cdt = utc_to_cdt(init_expire_time)
+    duration_seconds = int((parser.parse(expire_time_cdt) - parser.parse(start_time_cdt)).total_seconds())
+    duration_minutes = duration_seconds // 60
+    return f"{duration_minutes}"
+
+def save_to_csv(warnings, filename, priority_county=None):
+    priority_county = priority_county.lower()  # Ensure case-insensitivity
+    unique_counties = set()
+
+    with open(filename, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['WFO', 'Issuance Date', 'Issuance Time', 'Initial Expire Time', 'Verified', 'Counties', 'Time Active (minutes)'])
+
+        for feature in warnings['events']['features']:
+            counties = ", ".join(feature['properties']['ar_ugcname'])
+            unique_counties.update(feature['properties']['ar_ugcname'])  # Collect unique county names
+           # print(f"Processing counties: {counties}")
+            if priority_county in counties.lower():
+                wfo = feature['properties']['wfo']
+                issue_time_utc = feature['properties']['issue']
+                year = parser.parse(issue_time_utc).year
+                etn = feature['properties']['eventid']
+                print(f"Processing ETN: {etn}")
+                init_expire_time = get_detailed_warning_data(wfo, year, "TO", etn, "W")
+                if init_expire_time:
+                    issue_time_cdt = utc_to_cdt(issue_time_utc)
+                    expire_time_cdt = utc_to_cdt(init_expire_time)
+                    duration = calculate_duration(issue_time_utc, init_expire_time)
+                    verify = feature['properties'].get('verify', 'N/A')
+                    writer.writerow([wfo, issue_time_cdt.split(' ')[0], ' '.join(issue_time_cdt.split(' ')[1:]), ' '.join(expire_time_cdt.split(' ')[1:]), verify, counties, duration])
+                    print(f"Written ETN {etn} to CSV")
+                else:
+                    print(f"Skipping ETN {etn} due to missing initial expire time")
+            else:
+                print(f"Skipping due to no match in priority county: {priority_county}")
+
+    print(f"Unique counties processed: {unique_counties}")
+
+warnings = get_tornado_warnings(wfo, start_date, end_date)
+if warnings:
+    print("Tornado warnings data:")
+    print(warnings)
+    print("Saving warnings to CSV")
+    csv_filename = "tornado_warnings.csv"
+    save_to_csv(warnings, csv_filename, priority_county)
+    print("Data saved to CSV.")
+else:
+    print("No warnings to save")
